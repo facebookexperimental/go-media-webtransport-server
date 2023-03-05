@@ -1,0 +1,7 @@
+content/
+bin/
+certs/
+.vscode/
+__debug_bin
+src/go-media-webtransport-server
+.DS_Store
