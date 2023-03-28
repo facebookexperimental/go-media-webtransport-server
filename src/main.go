@@ -9,7 +9,6 @@ package main
 import (
 	"context"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -26,6 +25,7 @@ import (
 	"github.com/adriancable/webtransport-go"
 
 	"jordicenzano/go-media-webtransport-server/deliverysession"
+	"jordicenzano/go-media-webtransport-server/mediapackager"
 	"jordicenzano/go-media-webtransport-server/memfile"
 	"jordicenzano/go-media-webtransport-server/memfiles"
 )
@@ -91,6 +91,7 @@ func handleWebTransportIngestStreams(session *webtransport.Session, ingestSessio
 				if !isError {
 					headersSize := binary.BigEndian.Uint64(headersSizeBytes)
 					log.Info(fmt.Sprintf("%s(%v) - Reading %d bytes of headers", ingestSessionID, s.StreamID(), headersSize))
+					// TODO: Protect this from very high number
 					headerBytes := make([]byte, headersSize)
 					errReadHeaderSize := readBytes(&s, headerBytes)
 					if errReadHeaderSize != nil {
@@ -99,12 +100,12 @@ func handleWebTransportIngestStreams(session *webtransport.Session, ingestSessio
 					}
 
 					if !isError {
-						errUnmarshal := json.Unmarshal(headerBytes, &header)
-						if errUnmarshal != nil {
-							log.Error(fmt.Sprintf("%s(%v) - Error trying to parse header from uni stream. Contents: %s. Err: %v", ingestSessionID, s.StreamID(), headerBytes, errUnmarshal))
+						version, errPackager := mediapackager.Decode(headerBytes, &header)
+						if errPackager != nil {
+							log.Error(fmt.Sprintf("%s(%v) - Error trying to parse header from uni stream. Contents: %s. Err: %v", ingestSessionID, s.StreamID(), headerBytes, errPackager))
 							isError = true
 						}
-						log.Info(fmt.Sprintf("%s(%v) - Header decoded %v", ingestSessionID, s.StreamID(), header))
+						log.Info(fmt.Sprintf("%s(%v) - Header decoded %s: %v", ingestSessionID, s.StreamID(), mediapackager.VersionToString(version), header))
 					}
 				}
 
@@ -159,6 +160,9 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 
 	// Handle incoming unidirectional streams
 	go func() {
+		// Parse session QS data
+		rewindMs, videoJitterMs, audioJitterMs, startedAt, endAt, packagerVersion := parseWTQSData(urlQS)
+
 		// Create delivery session
 		deliverySession := deliverysession.New(assetID)
 
@@ -169,7 +173,7 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 			session.CloseWithError(1, "Problem getting audio init")
 			return
 		}
-		errAIniSend := sendFile(session, deliverySessionID, audioInitf)
+		errAIniSend := sendFile(session, deliverySessionID, audioInitf, packagerVersion)
 		if errAIniSend != nil {
 			log.Error(fmt.Sprintf("%s - Problem sending audio init for delivery uni stream, err: %v", deliverySessionID, errAIniSend))
 			session.CloseWithError(1, "Problem sending audio init")
@@ -183,15 +187,13 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 			session.CloseWithError(1, "Problem getting video init")
 			return
 		}
-		errVInisend := sendFile(session, deliverySessionID, videoInitf)
+		errVInisend := sendFile(session, deliverySessionID, videoInitf, packagerVersion)
 		if errVInisend != nil {
 			log.Error(fmt.Sprintf("%s - Problem sending video init for delivery uni stream, err: %v", deliverySessionID, errVInisend))
 			session.CloseWithError(1, "Problem sending video init")
 			return
 		}
 
-		// Parse session QS data
-		rewindMs, videoJitterMs, audioJitterMs, startedAt, endAt := parseWTQSData(urlQS)
 		if audioJitterMs <= 0 {
 			audioJitterMs = DELIVERY_SESSION_WINDOW_DEFAULT_MS
 			log.Info(fmt.Sprintf("%s - Defaulting the audio session window to %d ms", deliverySessionID, audioJitterMs))
@@ -225,7 +227,7 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 			if audioFileToSend != nil {
 				atomic.AddInt32(&inFlightReq, 1)
 				go func(f *memfile.MemFile) {
-					errAsend := sendFile(session, deliverySessionID, f)
+					errAsend := sendFile(session, deliverySessionID, f, packagerVersion)
 					if errAsend != nil {
 						log.Error(fmt.Sprintf("%s - Sending audio segment. SeqID: %d. Err: %v", deliverySessionID, f.Headers.SeqId, errAsend))
 						atomic.AddInt32(&exitFunc, 1) // exit Probably context is gone
@@ -250,7 +252,7 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 				if videoFileToSend != nil {
 					atomic.AddInt32(&inFlightReq, 1)
 					go func(f *memfile.MemFile) {
-						errVsend := sendFile(session, deliverySessionID, f)
+						errVsend := sendFile(session, deliverySessionID, f, packagerVersion)
 						if errVsend != nil {
 							log.Error(fmt.Sprintf("%s - Sending video segment. SeqID: %d. Err: %v", deliverySessionID, f.Headers.SeqId, errVsend))
 							atomic.AddInt32(&exitFunc, 1) // exit Probably context is gone
@@ -285,15 +287,15 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 
 // Helpers
 
-func sendFile(session *webtransport.Session, deliverySessionID string, f *memfile.MemFile) error {
+func sendFile(session *webtransport.Session, deliverySessionID string, f *memfile.MemFile, packagerVersion mediapackager.PackagerVersion) error {
 	sUni, errOpenStream := session.OpenUniStreamSync(session.Context())
 	if errOpenStream != nil {
 		return errOpenStream
 	}
 
-	dataHeaderBytes, errDataHeaderEncode := EncodeFileHeaders(f)
+	dataHeaderBytes, errDataHeaderEncode := mediapackager.Encode(f.Headers, packagerVersion)
 	if errDataHeaderEncode != nil {
-		return errors.New(fmt.Sprintf("Encoding headers for streamID: %v, err: %v", sUni.StreamID(), errDataHeaderEncode))
+		return errors.New(fmt.Sprintf("Encoding headers for streamID: %v, version: %s, err: %v", sUni.StreamID(), mediapackager.VersionToString(packagerVersion), errDataHeaderEncode))
 	}
 
 	dataHeaderLengthBytes := make([]byte, 8)
@@ -324,18 +326,6 @@ func sendFile(session *webtransport.Session, deliverySessionID string, f *memfil
 	return errSend
 }
 
-func EncodeFileHeaders(f *memfile.MemFile) ([]byte, error) {
-	// Perhaps we should do some filtering
-
-	ret, err := json.Marshal(f.Headers)
-	if err != nil {
-		return nil, err
-	}
-
-	// Assuming encodes to UTF-8 (TODO: double check)
-	return []byte(ret), nil
-}
-
 func getSendFile(assetID string, mediaType string, rewindMs uint, memFiles *memfiles.MemFiles, deliverySession *deliverysession.DeliverySession, playerJitterBufferMs uint, startedAt time.Time, endAt time.Time) (f *memfile.MemFile, err error) {
 	if !startedAt.IsZero() && !endAt.IsZero() {
 		// Vod / highlight
@@ -352,7 +342,7 @@ func getSendFile(assetID string, mediaType string, rewindMs uint, memFiles *memf
 	return
 }
 
-func parseWTQSData(urlQS url.Values) (bufferSizeMs uint, videoJitterMs uint, audioJitterMs uint, startedAt time.Time, endAt time.Time) {
+func parseWTQSData(urlQS url.Values) (bufferSizeMs uint, videoJitterMs uint, audioJitterMs uint, startedAt time.Time, endAt time.Time, packagerVersion mediapackager.PackagerVersion) {
 	// Get buffer size (ms)
 	bufferSizeSecsMsStr := urlQS.Get("old_ms")
 	if bufferSizeSecsMsStr != "" {
@@ -380,6 +370,9 @@ func parseWTQSData(urlQS url.Values) (bufferSizeMs uint, videoJitterMs uint, aud
 	if errSa == nil {
 		endAt = time.UnixMilli(endAtEpochMs)
 	}
+
+	packagerVersion = mediapackager.StringToVersion(urlQS.Get("pk"))
+
 	return
 }
 
