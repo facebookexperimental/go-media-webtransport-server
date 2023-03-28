@@ -33,6 +33,7 @@ import (
 const CACHE_CLEAN_UP_PERIOD_MS = 10000
 const NO_MORE_FRAMES_WAIT_MS = 5
 const COPY_BLOCK_BYTES = 2048
+const HEADER_SIZE_LIMIT_BYTES = 500 * 1024 // Header size limit
 
 // Delivery: Sent data up to Xms before live edge pointer
 const DELIVERY_SESSION_WINDOW_DEFAULT_MS = 300
@@ -91,21 +92,24 @@ func handleWebTransportIngestStreams(session *webtransport.Session, ingestSessio
 				if !isError {
 					headersSize := binary.BigEndian.Uint64(headersSizeBytes)
 					log.Info(fmt.Sprintf("%s(%v) - Reading %d bytes of headers", ingestSessionID, s.StreamID(), headersSize))
-					// TODO: Protect this from very high number
-					headerBytes := make([]byte, headersSize)
-					errReadHeaderSize := readBytes(&s, headerBytes)
-					if errReadHeaderSize != nil {
-						log.Error(fmt.Sprintf("%s(%v) - Error trying to read header from uni stream. Err: %v", ingestSessionID, s.StreamID(), errReadHeaderSize))
+					if headersSize >= HEADER_SIZE_LIMIT_BYTES {
+						log.Error(fmt.Sprintf("%s(%v) - Error the header size is above allowed threshold. Requested (bytes): %d, Max allowed(bytes): %d", ingestSessionID, s.StreamID(), headersSize, HEADER_SIZE_LIMIT_BYTES))
 						isError = true
-					}
-
-					if !isError {
-						version, errPackager := mediapackager.Decode(headerBytes, &header)
-						if errPackager != nil {
-							log.Error(fmt.Sprintf("%s(%v) - Error trying to parse header from uni stream. Contents: %s. Err: %v", ingestSessionID, s.StreamID(), headerBytes, errPackager))
+					} else {
+						headerBytes := make([]byte, headersSize)
+						errReadHeaderSize := readBytes(&s, headerBytes)
+						if errReadHeaderSize != nil {
+							log.Error(fmt.Sprintf("%s(%v) - Error trying to read header from uni stream. Err: %v", ingestSessionID, s.StreamID(), errReadHeaderSize))
 							isError = true
 						}
-						log.Info(fmt.Sprintf("%s(%v) - Header decoded %s: %v", ingestSessionID, s.StreamID(), mediapackager.VersionToString(version), header))
+						if !isError {
+							version, errPackager := mediapackager.Decode(headerBytes, &header)
+							if errPackager != nil {
+								log.Error(fmt.Sprintf("%s(%v) - Error trying to parse header from uni stream. Contents: %s. Err: %v", ingestSessionID, s.StreamID(), headerBytes, errPackager))
+								isError = true
+							}
+							log.Info(fmt.Sprintf("%s(%v) - Header decoded %s: %v", ingestSessionID, s.StreamID(), mediapackager.VersionToString(version), header))
+						}
 					}
 				}
 
