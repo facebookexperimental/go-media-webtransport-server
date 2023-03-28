@@ -11,12 +11,7 @@ Important notes:
 Fig1: Main block diagram
 
 # Packager
-We use a very experimental, flexible, and NON optimal packager that it was created for specifically for this, see fig2
-
-This server ONLY accesses to the data in the frame HEADER 
-
-![Media packager](./pics/WebCodecs-Packager.png)
-Fig2: Media packager
+See media packager information in this [link](https://github.com/facebookexperimental/webcodecs-capture-play#packager)
 
 # Cache key
 The unique frame key used to identify a frame object is:
