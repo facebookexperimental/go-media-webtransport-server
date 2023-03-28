@@ -41,13 +41,14 @@ https://[HOST]:4433/moqingest/[streamID]
 ## Delivery process
 - This server accepts WebTransport sessions for **delivery** in the following entry point:
 ```
-https://[HOST]:4433/moqdelivery/[streamID]?old_ms=X&vj_ms=V&aj_ms=A[,sa=S][,ea=E]
+https://[HOST]:4433/moqdelivery/[streamID]?old_ms=X&vj_ms=V&aj_ms=A[,sa=S][,pk=[V1Json/V2Binary]]
 ```
 - `old_ms`: Time in ms from live edge (0 = live edge)
 - `vj_ms`: Player video jitter buffer size in ms
 - `aj_ms`: Player audio jitter buffer size in ms
 - `sa`: Time for the highlight to start in EPOCH ms
 - `ea`: Time for the highlight to end in EPOCH ms
+- `pk`: Type of media packager to use (requesting to a relay to use this one)
 
 - Depending on the QS params the server selects the session delivery type:
     - If (`sa` > 0 && `ea` > 0) -> VOD/Highlight
