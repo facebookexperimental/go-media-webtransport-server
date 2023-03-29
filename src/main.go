@@ -41,6 +41,9 @@ const DELIVERY_SESSION_WINDOW_DEFAULT_MS = 300
 // Delivery: Kill delivery session of inflight request is higher than this
 const MAX_INFLIGHT_REQUEST = 300
 
+// Delivery: Max inflight request before stop sending video
+const MAX_INFLIGHT_REQUEST_BEFORE_STOP_VIDEO = 30
+
 func readBytes(s *webtransport.ReceiveStream, buffer []byte) error {
 	readSize := 0
 	totalSize := len(buffer)
@@ -164,6 +167,8 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 
 	// Handle incoming unidirectional streams
 	go func() {
+		var inFlightReq int32 = 0
+
 		// Parse session QS data
 		rewindMs, videoJitterMs, audioJitterMs, startedAt, endAt, packagerVersion := parseWTQSData(urlQS)
 
@@ -177,7 +182,7 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 			session.CloseWithError(1, "Problem getting audio init")
 			return
 		}
-		errAIniSend := sendFile(session, deliverySessionID, audioInitf, packagerVersion)
+		errAIniSend := sendFile(session, deliverySessionID, &inFlightReq, audioInitf, packagerVersion)
 		if errAIniSend != nil {
 			log.Error(fmt.Sprintf("%s - Problem sending audio init for delivery uni stream, err: %v", deliverySessionID, errAIniSend))
 			session.CloseWithError(1, "Problem sending audio init")
@@ -191,7 +196,7 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 			session.CloseWithError(1, "Problem getting video init")
 			return
 		}
-		errVInisend := sendFile(session, deliverySessionID, videoInitf, packagerVersion)
+		errVInisend := sendFile(session, deliverySessionID, &inFlightReq, videoInitf, packagerVersion)
 		if errVInisend != nil {
 			log.Error(fmt.Sprintf("%s - Problem sending video init for delivery uni stream, err: %v", deliverySessionID, errVInisend))
 			session.CloseWithError(1, "Problem sending video init")
@@ -208,60 +213,53 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 		}
 		log.Info(fmt.Sprintf("%s - rewindMs: %d ms, videoJitterMs: %d ms, audioJitterMs: %d ms, startedAt: %v, endAt: %v", deliverySessionID, rewindMs, videoJitterMs, audioJitterMs, startedAt, endAt))
 
-		var inFlightReq int32 = 0
-		var lastInflightReq int32 = 0
-
 		var exitFunc int32 = 0
 		for atomic.LoadInt32(&exitFunc) <= 0 {
 			somethingSent := false
 
 			// Sequence based on seqId
-			audioFileToSend, errGetStartAudioFile := getSendFile(assetID, "audio", rewindMs, memFiles, deliverySession, audioJitterMs, startedAt, endAt)
-			if errGetStartAudioFile != nil {
-				if errGetStartAudioFile.Error() == "EOS" {
+			audioFileToSend, errGetAudioFile := getSendFile(assetID, "audio", rewindMs, memFiles, deliverySession, audioJitterMs, startedAt, endAt)
+			if errGetAudioFile != nil {
+				if errGetAudioFile.Error() == "EOS" {
 					log.Info(fmt.Sprintf("%s - Audio, detected end of stream", deliverySessionID))
 					atomic.AddInt32(&exitFunc, 1)
 				} else {
-					log.Error(fmt.Sprintf("%s - Problem getting audio segment for delivery uni stream, err: %v", deliverySessionID, errGetStartAudioFile))
+					log.Error(fmt.Sprintf("%s - Problem getting audio segment for delivery uni stream, err: %v", deliverySessionID, errGetAudioFile))
 					session.CloseWithError(1, "Problem getting audio segment")
 					return
 				}
 			}
 
 			if audioFileToSend != nil {
-				atomic.AddInt32(&inFlightReq, 1)
 				go func(f *memfile.MemFile) {
-					errAsend := sendFile(session, deliverySessionID, f, packagerVersion)
+					errAsend := sendFile(session, deliverySessionID, &inFlightReq, f, packagerVersion)
 					if errAsend != nil {
 						log.Error(fmt.Sprintf("%s - Sending audio segment. SeqID: %d. Err: %v", deliverySessionID, f.Headers.SeqId, errAsend))
 						atomic.AddInt32(&exitFunc, 1) // exit Probably context is gone
 					}
-					atomic.AddInt32(&inFlightReq, -1)
 				}(audioFileToSend)
 				somethingSent = true
 			}
 
-			if !somethingSent {
-				videoFileToSend, errGetStartVideoFile := getSendFile(assetID, "video", rewindMs, memFiles, deliverySession, videoJitterMs, startedAt, endAt)
-				if errGetStartVideoFile != nil {
-					if errGetStartVideoFile.Error() == "EOS" {
+			if !somethingSent && atomic.LoadInt32(&inFlightReq) < MAX_INFLIGHT_REQUEST_BEFORE_STOP_VIDEO {
+				videoFileToSend, errGetVideoFile := getSendFile(assetID, "video", rewindMs, memFiles, deliverySession, videoJitterMs, startedAt, endAt)
+				if errGetVideoFile != nil {
+					if errGetVideoFile.Error() == "EOS" {
 						log.Info(fmt.Sprintf("%s - Video, detected end of stream", deliverySessionID))
 						atomic.AddInt32(&exitFunc, 1)
 					} else {
-						log.Error(fmt.Sprintf("%s - Problem getting video segment for delivery uni stream, err: %v", deliverySessionID, errGetStartVideoFile))
+						log.Error(fmt.Sprintf("%s - Problem getting video segment for delivery uni stream, err: %v", deliverySessionID, errGetVideoFile))
 						session.CloseWithError(1, "Problem getting video segment")
 						return
 					}
 				}
 				if videoFileToSend != nil {
-					atomic.AddInt32(&inFlightReq, 1)
 					go func(f *memfile.MemFile) {
-						errVsend := sendFile(session, deliverySessionID, f, packagerVersion)
+						errVsend := sendFile(session, deliverySessionID, &inFlightReq, f, packagerVersion)
 						if errVsend != nil {
 							log.Error(fmt.Sprintf("%s - Sending video segment. SeqID: %d. Err: %v", deliverySessionID, f.Headers.SeqId, errVsend))
 							atomic.AddInt32(&exitFunc, 1) // exit Probably context is gone
 						}
-						atomic.AddInt32(&inFlightReq, -1)
 					}(videoFileToSend)
 					somethingSent = true
 				}
@@ -270,14 +268,9 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 			if !somethingSent {
 				time.Sleep(time.Duration(NO_MORE_FRAMES_WAIT_MS) * time.Millisecond)
 			} else {
-				currentInflightReq := atomic.LoadInt32(&inFlightReq)
-				if currentInflightReq != lastInflightReq {
-					log.Info(fmt.Sprintf("%s - Current inflight requests: %d", deliverySessionID, currentInflightReq))
-					lastInflightReq = currentInflightReq
-				}
 				log.Info(fmt.Sprintf("%s - Delivery sessions elements: %d", deliverySessionID, deliverySession.GetNumElements()))
 
-				if currentInflightReq >= MAX_INFLIGHT_REQUEST {
+				if atomic.LoadInt32(&inFlightReq) >= MAX_INFLIGHT_REQUEST {
 					atomic.AddInt32(&exitFunc, 1)
 					log.Error(fmt.Sprintf("%s - killing session because too many inflight requests", deliverySessionID))
 				}
@@ -291,15 +284,22 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 
 // Helpers
 
-func sendFile(session *webtransport.Session, deliverySessionID string, f *memfile.MemFile, packagerVersion mediapackager.PackagerVersion) error {
+func sendFile(session *webtransport.Session, deliverySessionID string, inFlightReq *int32, f *memfile.MemFile, packagerVersion mediapackager.PackagerVersion) error {
 	sUni, errOpenStream := session.OpenUniStreamSync(session.Context())
 	if errOpenStream != nil {
 		return errOpenStream
 	}
 
+	atomic.AddInt32(inFlightReq, 1)
+
+	atomic.LoadInt32(inFlightReq)
+
+	log.Info(fmt.Sprintf("%s(%v) - Start sending frame. MediaType: %s, SeqID: %d (current inflight: %d)", deliverySessionID, sUni.StreamID(), f.Headers.MediaType, f.Headers.SeqId, atomic.LoadInt32(inFlightReq)))
+
 	dataHeaderBytes, errDataHeaderEncode := mediapackager.Encode(f.Headers, packagerVersion)
 	if errDataHeaderEncode != nil {
-		return errors.New(fmt.Sprintf("Encoding headers for streamID: %v, version: %s, err: %v", sUni.StreamID(), mediapackager.VersionToString(packagerVersion), errDataHeaderEncode))
+		atomic.AddInt32(inFlightReq, -1)
+		return errors.New(fmt.Sprintf("Encoding header for streamID: %v, version: %s, err: %v", sUni.StreamID(), mediapackager.VersionToString(packagerVersion), errDataHeaderEncode))
 	}
 
 	dataHeaderLengthBytes := make([]byte, 8)
@@ -321,12 +321,16 @@ func sendFile(session *webtransport.Session, deliverySessionID string, f *memfil
 	}
 	errReaderClose := srcReader.Close()
 	if errReaderClose != nil {
+		atomic.AddInt32(inFlightReq, -1)
 		return errReaderClose
 	}
 	errSend := sUni.Close()
 	if errSend == nil {
 		log.Info(fmt.Sprintf("%s(%v) - Sent frame. MediaType: %s, SeqID: %d", deliverySessionID, sUni.StreamID(), f.Headers.MediaType, f.Headers.SeqId))
 	}
+
+	atomic.AddInt32(inFlightReq, -1)
+
 	return errSend
 }
 
