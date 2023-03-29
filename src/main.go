@@ -41,6 +41,9 @@ const DELIVERY_SESSION_WINDOW_DEFAULT_MS = 300
 // Delivery: Kill delivery session of inflight request is higher than this
 const MAX_INFLIGHT_REQUEST = 300
 
+// Delivery: Max inflight request before stop sending video
+const MAX_INFLIGHT_REQUEST_BEFORE_STOP_VIDEO = 30
+
 func readBytes(s *webtransport.ReceiveStream, buffer []byte) error {
 	readSize := 0
 	totalSize := len(buffer)
@@ -209,20 +212,21 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 		log.Info(fmt.Sprintf("%s - rewindMs: %d ms, videoJitterMs: %d ms, audioJitterMs: %d ms, startedAt: %v, endAt: %v", deliverySessionID, rewindMs, videoJitterMs, audioJitterMs, startedAt, endAt))
 
 		var inFlightReq int32 = 0
-		var lastInflightReq int32 = 0
+		var currentInflightReq int32 = 0
 
 		var exitFunc int32 = 0
 		for atomic.LoadInt32(&exitFunc) <= 0 {
+			currentInflightReq = atomic.LoadInt32(&inFlightReq)
 			somethingSent := false
 
 			// Sequence based on seqId
-			audioFileToSend, errGetStartAudioFile := getSendFile(assetID, "audio", rewindMs, memFiles, deliverySession, audioJitterMs, startedAt, endAt)
-			if errGetStartAudioFile != nil {
-				if errGetStartAudioFile.Error() == "EOS" {
+			audioFileToSend, errGetAudioFile := getSendFile(assetID, "audio", rewindMs, memFiles, deliverySession, audioJitterMs, startedAt, endAt)
+			if errGetAudioFile != nil {
+				if errGetAudioFile.Error() == "EOS" {
 					log.Info(fmt.Sprintf("%s - Audio, detected end of stream", deliverySessionID))
 					atomic.AddInt32(&exitFunc, 1)
 				} else {
-					log.Error(fmt.Sprintf("%s - Problem getting audio segment for delivery uni stream, err: %v", deliverySessionID, errGetStartAudioFile))
+					log.Error(fmt.Sprintf("%s - Problem getting audio segment for delivery uni stream, err: %v", deliverySessionID, errGetAudioFile))
 					session.CloseWithError(1, "Problem getting audio segment")
 					return
 				}
@@ -241,14 +245,14 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 				somethingSent = true
 			}
 
-			if !somethingSent {
-				videoFileToSend, errGetStartVideoFile := getSendFile(assetID, "video", rewindMs, memFiles, deliverySession, videoJitterMs, startedAt, endAt)
-				if errGetStartVideoFile != nil {
-					if errGetStartVideoFile.Error() == "EOS" {
+			if !somethingSent && currentInflightReq < MAX_INFLIGHT_REQUEST_BEFORE_STOP_VIDEO {
+				videoFileToSend, errGetVideoFile := getSendFile(assetID, "video", rewindMs, memFiles, deliverySession, videoJitterMs, startedAt, endAt)
+				if errGetVideoFile != nil {
+					if errGetVideoFile.Error() == "EOS" {
 						log.Info(fmt.Sprintf("%s - Video, detected end of stream", deliverySessionID))
 						atomic.AddInt32(&exitFunc, 1)
 					} else {
-						log.Error(fmt.Sprintf("%s - Problem getting video segment for delivery uni stream, err: %v", deliverySessionID, errGetStartVideoFile))
+						log.Error(fmt.Sprintf("%s - Problem getting video segment for delivery uni stream, err: %v", deliverySessionID, errGetVideoFile))
 						session.CloseWithError(1, "Problem getting video segment")
 						return
 					}
@@ -270,12 +274,7 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 			if !somethingSent {
 				time.Sleep(time.Duration(NO_MORE_FRAMES_WAIT_MS) * time.Millisecond)
 			} else {
-				currentInflightReq := atomic.LoadInt32(&inFlightReq)
-				if currentInflightReq != lastInflightReq {
-					log.Info(fmt.Sprintf("%s - Current inflight requests: %d", deliverySessionID, currentInflightReq))
-					lastInflightReq = currentInflightReq
-				}
-				log.Info(fmt.Sprintf("%s - Delivery sessions elements: %d", deliverySessionID, deliverySession.GetNumElements()))
+				log.Info(fmt.Sprintf("%s - Delivery sessions elements: %d. Current inflight requests: %d", deliverySessionID, deliverySession.GetNumElements(), currentInflightReq))
 
 				if currentInflightReq >= MAX_INFLIGHT_REQUEST {
 					atomic.AddInt32(&exitFunc, 1)
