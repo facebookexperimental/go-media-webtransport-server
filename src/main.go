@@ -55,8 +55,8 @@ const MAX_INFLIGHT_REQUEST_BEFORE_STOP_VIDEO = 30
 // Delivery: Audio will have this priority over video
 const AUDIO_OFFSET_SEND_PRIORITY = math.MaxInt / 2
 
-// Delivery: Cancel request after
-const LIVE_CANCEL_AFTER_TIMES_JITTER = 10
+// Delivery: Cancel request after (0 means NO cancel)
+const LIVE_CANCEL_AFTER_TIMES_JITTER = 0
 
 func readBytes(s *webtransport.ReceiveStream, buffer []byte) error {
 	readSize := 0
@@ -260,10 +260,6 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 				somethingSent = true
 			}
 
-			//TODO:
-			// Close session
-			// Kill after Xs
-
 			if !somethingSent && atomic.LoadInt32(&inFlightReq) < MAX_INFLIGHT_REQUEST_BEFORE_STOP_VIDEO {
 				videoFileToSend, errGetVideoFile := getSendFile(sessionType, assetID, "video", rewindMs, memFiles, deliverySession, videoJitterMs, startedAt, endAt)
 				if errGetVideoFile != nil {
@@ -302,9 +298,6 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 				}
 			}
 		}
-
-		// TODO: Graceful close
-		//session.CloseWithError()
 	}()
 }
 
@@ -335,7 +328,7 @@ func getSendPriority(sessionType string, mediaType string, seqId int64) int {
 
 func getExpirationDuration(sessionType string, jitterBufferMs uint) time.Duration {
 	var ret time.Duration = 0
-	if sessionType == DeliverySessionLiveEdge {
+	if sessionType == DeliverySessionLiveEdge && LIVE_CANCEL_AFTER_TIMES_JITTER > 0 {
 		ret = time.Duration(jitterBufferMs*LIVE_CANCEL_AFTER_TIMES_JITTER) * time.Millisecond
 	}
 	return ret
@@ -361,7 +354,9 @@ func sendFile(session *webtransport.Session, deliverySessionID string, inFlightR
 		return errOpenStream
 	}
 	sUni.SetPriority(sendPriority)
+
 	if expiration > 0 {
+		// This closes gracefully the stream, so the received does NOT know it is uncomplete
 		sUni.SetWriteDeadline(time.Now().Add(expiration))
 	}
 
