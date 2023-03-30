@@ -7,11 +7,11 @@ LICENSE file in the root directory of this source tree.
 package main
 
 import (
-	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -22,12 +22,20 @@ import (
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/adriancable/webtransport-go"
+	"github.com/kixelated/quic-go/http3"
+	"github.com/kixelated/webtransport-go"
 
 	"jordicenzano/go-media-webtransport-server/deliverysession"
 	"jordicenzano/go-media-webtransport-server/mediapackager"
 	"jordicenzano/go-media-webtransport-server/memfile"
 	"jordicenzano/go-media-webtransport-server/memfiles"
+)
+
+// Delivery: Types of sessions
+const (
+	DeliverySessionLiveEdge   string = "edge"
+	DeliverySessionLiveRewind        = "rewind"
+	DeliverySessionVOD               = "vod"
 )
 
 const CACHE_CLEAN_UP_PERIOD_MS = 10000
@@ -44,6 +52,12 @@ const MAX_INFLIGHT_REQUEST = 300
 // Delivery: Max inflight request before stop sending video
 const MAX_INFLIGHT_REQUEST_BEFORE_STOP_VIDEO = 30
 
+// Delivery: Audio will have this priority over video
+const AUDIO_OFFSET_SEND_PRIORITY = math.MaxInt / 2
+
+// Delivery: Cancel request after
+const LIVE_CANCEL_AFTER_TIMES_JITTER = 10
+
 func readBytes(s *webtransport.ReceiveStream, buffer []byte) error {
 	readSize := 0
 	totalSize := len(buffer)
@@ -51,7 +65,7 @@ func readBytes(s *webtransport.ReceiveStream, buffer []byte) error {
 	for readSize < totalSize && err == nil {
 		n := 0
 		tmpBuffer := make([]byte, totalSize-readSize)
-		n, err = s.Read(tmpBuffer)
+		n, err = io.ReadFull(*s, tmpBuffer)
 		copy(buffer[readSize:readSize+n], tmpBuffer[0:n])
 
 		readSize += n
@@ -75,12 +89,12 @@ func handleWebTransportIngestStreams(session *webtransport.Session, ingestSessio
 	// Handle incoming unidirectional streams
 	go func() {
 		for {
-			s, errAccUni := session.AcceptUniStream(session.Context())
+			rxStream, errAccUni := session.AcceptUniStream(session.Context())
 			if errAccUni != nil {
 				log.Error(fmt.Sprintf("%s - Session closed, not accepting more uni streams: %v", ingestSessionID, errAccUni))
 				break
 			}
-			log.Info(fmt.Sprintf("%s(%v) - Accepting incoming uni stream", ingestSessionID, s.StreamID()))
+			log.Info(fmt.Sprintf("%s(%v) - Accepting incoming uni stream", ingestSessionID, rxStream.StreamID()))
 
 			go func(s webtransport.ReceiveStream) {
 				isError := false
@@ -146,7 +160,7 @@ func handleWebTransportIngestStreams(session *webtransport.Session, ingestSessio
 						f.Close()
 					}
 				}
-			}(s)
+			}(rxStream)
 		}
 	}()
 }
@@ -172,6 +186,8 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 		// Parse session QS data
 		rewindMs, videoJitterMs, audioJitterMs, startedAt, endAt, packagerVersion := parseWTQSData(urlQS)
 
+		sessionType := getDeliverySessionType(rewindMs, startedAt, endAt)
+
 		// Create delivery session
 		deliverySession := deliverysession.New(assetID)
 
@@ -182,7 +198,7 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 			session.CloseWithError(1, "Problem getting audio init")
 			return
 		}
-		errAIniSend := sendFile(session, deliverySessionID, &inFlightReq, audioInitf, packagerVersion)
+		errAIniSend := sendFile(session, deliverySessionID, &inFlightReq, audioInitf, packagerVersion, math.MaxInt, 0)
 		if errAIniSend != nil {
 			log.Error(fmt.Sprintf("%s - Problem sending audio init for delivery uni stream, err: %v", deliverySessionID, errAIniSend))
 			session.CloseWithError(1, "Problem sending audio init")
@@ -196,7 +212,7 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 			session.CloseWithError(1, "Problem getting video init")
 			return
 		}
-		errVInisend := sendFile(session, deliverySessionID, &inFlightReq, videoInitf, packagerVersion)
+		errVInisend := sendFile(session, deliverySessionID, &inFlightReq, videoInitf, packagerVersion, math.MaxInt, 0)
 		if errVInisend != nil {
 			log.Error(fmt.Sprintf("%s - Problem sending video init for delivery uni stream, err: %v", deliverySessionID, errVInisend))
 			session.CloseWithError(1, "Problem sending video init")
@@ -218,7 +234,7 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 			somethingSent := false
 
 			// Sequence based on seqId
-			audioFileToSend, errGetAudioFile := getSendFile(assetID, "audio", rewindMs, memFiles, deliverySession, audioJitterMs, startedAt, endAt)
+			audioFileToSend, errGetAudioFile := getSendFile(sessionType, assetID, "audio", rewindMs, memFiles, deliverySession, audioJitterMs, startedAt, endAt)
 			if errGetAudioFile != nil {
 				if errGetAudioFile.Error() == "EOS" {
 					log.Info(fmt.Sprintf("%s - Audio, detected end of stream", deliverySessionID))
@@ -232,17 +248,24 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 
 			if audioFileToSend != nil {
 				go func(f *memfile.MemFile) {
-					errAsend := sendFile(session, deliverySessionID, &inFlightReq, f, packagerVersion)
-					if errAsend != nil {
-						log.Error(fmt.Sprintf("%s - Sending audio segment. SeqID: %d. Err: %v", deliverySessionID, f.Headers.SeqId, errAsend))
+					sendPriority := getSendPriority(sessionType, f.Headers.MediaType, f.Headers.SeqId)
+					expiration := getExpirationDuration(sessionType, audioJitterMs)
+
+					errASend := sendFile(session, deliverySessionID, &inFlightReq, f, packagerVersion, sendPriority, expiration)
+					if errASend != nil {
+						log.Error(fmt.Sprintf("%s - Sending audio segment. SeqID: %d. Err: %v", deliverySessionID, f.Headers.SeqId, errASend))
 						atomic.AddInt32(&exitFunc, 1) // exit Probably context is gone
 					}
 				}(audioFileToSend)
 				somethingSent = true
 			}
 
+			//TODO:
+			// Close session
+			// Kill after Xs
+
 			if !somethingSent && atomic.LoadInt32(&inFlightReq) < MAX_INFLIGHT_REQUEST_BEFORE_STOP_VIDEO {
-				videoFileToSend, errGetVideoFile := getSendFile(assetID, "video", rewindMs, memFiles, deliverySession, videoJitterMs, startedAt, endAt)
+				videoFileToSend, errGetVideoFile := getSendFile(sessionType, assetID, "video", rewindMs, memFiles, deliverySession, videoJitterMs, startedAt, endAt)
 				if errGetVideoFile != nil {
 					if errGetVideoFile.Error() == "EOS" {
 						log.Info(fmt.Sprintf("%s - Video, detected end of stream", deliverySessionID))
@@ -255,7 +278,10 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 				}
 				if videoFileToSend != nil {
 					go func(f *memfile.MemFile) {
-						errVsend := sendFile(session, deliverySessionID, &inFlightReq, f, packagerVersion)
+						sendPriority := getSendPriority(sessionType, f.Headers.MediaType, f.Headers.SeqId)
+						expiration := getExpirationDuration(sessionType, videoJitterMs)
+
+						errVsend := sendFile(session, deliverySessionID, &inFlightReq, f, packagerVersion, sendPriority, expiration)
 						if errVsend != nil {
 							log.Error(fmt.Sprintf("%s - Sending video segment. SeqID: %d. Err: %v", deliverySessionID, f.Headers.SeqId, errVsend))
 							atomic.AddInt32(&exitFunc, 1) // exit Probably context is gone
@@ -277,17 +303,66 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 			}
 		}
 
-		// Graceful close
-		session.CloseSession()
+		// TODO: Graceful close
+		//session.CloseWithError()
 	}()
 }
 
 // Helpers
 
-func sendFile(session *webtransport.Session, deliverySessionID string, inFlightReq *int32, f *memfile.MemFile, packagerVersion mediapackager.PackagerVersion) error {
+func getSendPriority(sessionType string, mediaType string, seqId int64) int {
+	//TODO: To properly prioritize between sync streams we should use DTS
+	// Consider rollovers
+	var ret int = 0
+	switch sessionType {
+	case DeliverySessionLiveEdge:
+		if mediaType == "audio" {
+			ret = int(seqId) + AUDIO_OFFSET_SEND_PRIORITY
+		} else {
+			ret = int(seqId)
+		}
+	case DeliverySessionLiveRewind, DeliverySessionVOD:
+		if mediaType == "audio" {
+			ret = math.MaxInt - int(seqId)
+		} else {
+			ret = math.MaxInt - int(seqId) - AUDIO_OFFSET_SEND_PRIORITY
+		}
+	default:
+		ret = 0
+	}
+	return ret
+}
+
+func getExpirationDuration(sessionType string, jitterBufferMs uint) time.Duration {
+	var ret time.Duration = 0
+	if sessionType == DeliverySessionLiveEdge {
+		ret = time.Duration(jitterBufferMs*LIVE_CANCEL_AFTER_TIMES_JITTER) * time.Millisecond
+	}
+	return ret
+}
+
+func getDeliverySessionType(rewindMs uint, startedAt time.Time, endAt time.Time) string {
+	if !startedAt.IsZero() && !endAt.IsZero() {
+		// Vod / highlight
+		return DeliverySessionVOD
+	} else {
+		if rewindMs > 0 {
+			// Rewind
+			return DeliverySessionLiveRewind
+		}
+	}
+	// Edge
+	return DeliverySessionLiveEdge
+}
+
+func sendFile(session *webtransport.Session, deliverySessionID string, inFlightReq *int32, f *memfile.MemFile, packagerVersion mediapackager.PackagerVersion, sendPriority int, expiration time.Duration) error {
 	sUni, errOpenStream := session.OpenUniStreamSync(session.Context())
 	if errOpenStream != nil {
 		return errOpenStream
+	}
+	sUni.SetPriority(sendPriority)
+	if expiration > 0 {
+		sUni.SetWriteDeadline(time.Now().Add(expiration))
 	}
 
 	atomic.AddInt32(inFlightReq, 1)
@@ -334,19 +409,18 @@ func sendFile(session *webtransport.Session, deliverySessionID string, inFlightR
 	return errSend
 }
 
-func getSendFile(assetID string, mediaType string, rewindMs uint, memFiles *memfiles.MemFiles, deliverySession *deliverysession.DeliverySession, playerJitterBufferMs uint, startedAt time.Time, endAt time.Time) (f *memfile.MemFile, err error) {
-	if !startedAt.IsZero() && !endAt.IsZero() {
-		// Vod / highlight
+func getSendFile(sessionType string, assetID string, mediaType string, rewindMs uint, memFiles *memfiles.MemFiles, deliverySession *deliverysession.DeliverySession, playerJitterBufferMs uint, startedAt time.Time, endAt time.Time) (f *memfile.MemFile, err error) {
+	switch sessionType {
+	case DeliverySessionLiveEdge:
+		f = memFiles.GetFileForAssetNewestSeqId(assetID, mediaType, time.Duration(playerJitterBufferMs)*time.Millisecond, deliverySession)
+	case DeliverySessionLiveRewind:
+		f = memFiles.GetNextByTimeSeqId(assetID, mediaType, time.Duration(playerJitterBufferMs)*time.Millisecond, time.Duration(rewindMs)*time.Millisecond, deliverySession)
+	case DeliverySessionVOD:
 		f, err = memFiles.GetNextByStartEnd(assetID, mediaType, time.Duration(playerJitterBufferMs)*time.Millisecond, startedAt, endAt, deliverySession)
-	} else {
-		if rewindMs == 0 {
-			// Edge
-			f = memFiles.GetFileForAssetNewestSeqId(assetID, mediaType, time.Duration(playerJitterBufferMs)*time.Millisecond, deliverySession)
-		} else {
-			// Rewind
-			f = memFiles.GetNextByTimeSeqId(assetID, mediaType, time.Duration(playerJitterBufferMs)*time.Millisecond, time.Duration(rewindMs)*time.Millisecond, deliverySession)
-		}
+	default:
+		err = errors.New(fmt.Sprintf("Unknown session type: %s", sessionType))
 	}
+
 	return
 }
 
@@ -401,48 +475,46 @@ func main() {
 	// create memfiles
 	memFiles := memfiles.New(CACHE_CLEAN_UP_PERIOD_MS)
 
-	http.HandleFunc("/moqingest/", func(rw http.ResponseWriter, r *http.Request) {
-		session := r.Body.(*webtransport.Session)
-		session.AcceptSession()
-		// session.RejectSession(400)
-
-		ingestSessionID := "I-" + uuid.New().String() + "-" + r.URL.Path
-
-		log.Info(fmt.Sprintf("%s - Accepted incoming WebTransport session. rawQuery: %s", ingestSessionID, r.URL.RawQuery))
-
-		handleWebTransportIngestStreams(session, ingestSessionID, r.URL.Path, r.URL.Query(), memFiles)
-	})
-
-	http.HandleFunc("/moqdelivery/", func(rw http.ResponseWriter, r *http.Request) {
-		session := r.Body.(*webtransport.Session)
-		session.AcceptSession()
-
-		deliverySessionID := "D-" + uuid.New().String() + "-" + r.URL.Path
-
-		log.Info(fmt.Sprintf("%s - Accepted incoming WebTransport session. rawQuery: %s", deliverySessionID, r.URL.RawQuery))
-		handleWebTransportDeliveryStreams(session, deliverySessionID, r.URL.Path, r.URL.Query(), memFiles)
-	})
-
 	// Note: "new-tab-page" in AllowedOrigins lets you access the server from a blank tab (via DevTools Console).
 	// "" in AllowedOrigins lets you access the server from JavaScript loaded from disk (i.e. via a file:// URL)
 	server := &webtransport.Server{
-		ListenAddr:     ":4433",
-		TLSCert:        webtransport.CertFile{Path: "../certs/certificate.pem"},
-		TLSKey:         webtransport.CertFile{Path: "../certs/certificate.key"},
-		AllowedOrigins: []string{"moq-test.jordicenzano.dev", "googlechrome.github.io", "127.0.0.1:8080", "localhost:8080", "new-tab-page", ""},
-		QuicConfig: &webtransport.QuicConfig{
-			KeepAlive:      true,
-			MaxIdleTimeout: 30 * time.Second,
-		},
+		H3:          http3.Server{Addr: ":4433"},
+		CheckOrigin: func(r *http.Request) bool { return true },
 	}
 
-	log.Info("Launching WebTransport server at: ", server.ListenAddr)
-	ctx, cancel := context.WithCancel(context.Background())
-	if err := server.Run(ctx); err != nil {
-		log.Error(fmt.Sprintf("Server error: %s", err))
-		cancel()
-	}
+	http.HandleFunc("/moqingest/", func(rw http.ResponseWriter, r *http.Request) {
+		ingestSessionID := "I-" + uuid.New().String() + "-" + r.URL.Path
+
+		conn, err := server.Upgrade(rw, r)
+		if err != nil {
+			log.Printf("upgrading failed: %s", err)
+			log.Error(fmt.Sprintf("%s - Ingest connection upgrade failed, rawQuery: %s", ingestSessionID, r.URL.RawQuery))
+
+			rw.WriteHeader(500)
+			return
+		}
+		log.Info(fmt.Sprintf("%s - Accepted incoming WebTransport session. rawQuery: %s", ingestSessionID, r.URL.RawQuery))
+
+		handleWebTransportIngestStreams(conn, ingestSessionID, r.URL.Path, r.URL.Query(), memFiles)
+	})
+
+	http.HandleFunc("/moqdelivery/", func(rw http.ResponseWriter, r *http.Request) {
+		deliverySessionID := "D-" + uuid.New().String() + "-" + r.URL.Path
+		conn, err := server.Upgrade(rw, r)
+		if err != nil {
+			log.Error(fmt.Sprintf("%s - Delivery connection upgrade failed, rawQuery: %s", deliverySessionID, r.URL.RawQuery))
+
+			rw.WriteHeader(500)
+			return
+		}
+		log.Info(fmt.Sprintf("%s - Accepted incoming WebTransport session. rawQuery: %s", deliverySessionID, r.URL.RawQuery))
+
+		handleWebTransportDeliveryStreams(conn, deliverySessionID, r.URL.Path, r.URL.Query(), memFiles)
+	})
+
+	log.Info("Launching WebTransport server at: ", server.H3.Addr)
+
+	server.ListenAndServeTLS("../certs/certificate.pem", "../certs/certificate.key")
 
 	memFiles.Stop()
-
 }
