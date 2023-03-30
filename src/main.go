@@ -44,6 +44,16 @@ const MAX_INFLIGHT_REQUEST = 300
 // Delivery: Max inflight request before stop sending video
 const MAX_INFLIGHT_REQUEST_BEFORE_STOP_VIDEO = 30
 
+// Max estimated RTT. Used to cancel requests in live edge mode
+const MAX_ESTIMATED_RTT_MS = 300
+
+// string mapping
+const (
+	DeliverySessionLiveEdge   string = "edge"
+	DeliverySessionLiveRewind        = "rewind"
+	DeliverySessionVOD               = "vod"
+)
+
 func readBytes(s *webtransport.ReceiveStream, buffer []byte) error {
 	readSize := 0
 	totalSize := len(buffer)
@@ -151,6 +161,20 @@ func handleWebTransportIngestStreams(session *webtransport.Session, ingestSessio
 	}()
 }
 
+func getDeliverySessionType(rewindMs uint, startedAt time.Time, endAt time.Time) string {
+	if !startedAt.IsZero() && !endAt.IsZero() {
+		// Vod / highlight
+		return DeliverySessionVOD
+	} else {
+		if rewindMs > 0 {
+			// Rewind
+			return DeliverySessionLiveRewind
+		}
+	}
+	// Edge
+	return DeliverySessionLiveEdge
+}
+
 func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySessionID string, urlPath string, urlQS url.Values, memFiles *memfiles.MemFiles) {
 	// Get asset ID from URL path
 	assetID := ""
@@ -172,6 +196,8 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 		// Parse session QS data
 		rewindMs, videoJitterMs, audioJitterMs, startedAt, endAt, packagerVersion := parseWTQSData(urlQS)
 
+		sessionType := getDeliverySessionType(rewindMs, startedAt, endAt)
+
 		// Create delivery session
 		deliverySession := deliverysession.New(assetID)
 
@@ -182,7 +208,7 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 			session.CloseWithError(1, "Problem getting audio init")
 			return
 		}
-		errAIniSend := sendFile(session, deliverySessionID, &inFlightReq, audioInitf, packagerVersion)
+		errAIniSend := sendFile(session, deliverySessionID, &inFlightReq, audioInitf, packagerVersion, 0)
 		if errAIniSend != nil {
 			log.Error(fmt.Sprintf("%s - Problem sending audio init for delivery uni stream, err: %v", deliverySessionID, errAIniSend))
 			session.CloseWithError(1, "Problem sending audio init")
@@ -196,7 +222,7 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 			session.CloseWithError(1, "Problem getting video init")
 			return
 		}
-		errVInisend := sendFile(session, deliverySessionID, &inFlightReq, videoInitf, packagerVersion)
+		errVInisend := sendFile(session, deliverySessionID, &inFlightReq, videoInitf, packagerVersion, 0)
 		if errVInisend != nil {
 			log.Error(fmt.Sprintf("%s - Problem sending video init for delivery uni stream, err: %v", deliverySessionID, errVInisend))
 			session.CloseWithError(1, "Problem sending video init")
@@ -214,11 +240,17 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 		log.Info(fmt.Sprintf("%s - rewindMs: %d ms, videoJitterMs: %d ms, audioJitterMs: %d ms, startedAt: %v, endAt: %v", deliverySessionID, rewindMs, videoJitterMs, audioJitterMs, startedAt, endAt))
 
 		var exitFunc int32 = 0
+		var videoCancelAfter time.Duration = 0
+		var audioCancelAfter time.Duration = 0
+		if sessionType == DeliverySessionLiveEdge {
+			videoCancelAfter = time.Duration(videoJitterMs+MAX_ESTIMATED_RTT_MS) * time.Millisecond
+			audioCancelAfter = time.Duration(audioJitterMs+MAX_ESTIMATED_RTT_MS) * time.Millisecond
+		}
 		for atomic.LoadInt32(&exitFunc) <= 0 {
 			somethingSent := false
 
 			// Sequence based on seqId
-			audioFileToSend, errGetAudioFile := getSendFile(assetID, "audio", rewindMs, memFiles, deliverySession, audioJitterMs, startedAt, endAt)
+			audioFileToSend, errGetAudioFile := getSendFile(sessionType, assetID, "audio", rewindMs, memFiles, deliverySession, audioJitterMs, startedAt, endAt)
 			if errGetAudioFile != nil {
 				if errGetAudioFile.Error() == "EOS" {
 					log.Info(fmt.Sprintf("%s - Audio, detected end of stream", deliverySessionID))
@@ -232,7 +264,7 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 
 			if audioFileToSend != nil {
 				go func(f *memfile.MemFile) {
-					errAsend := sendFile(session, deliverySessionID, &inFlightReq, f, packagerVersion)
+					errAsend := sendFile(session, deliverySessionID, &inFlightReq, f, packagerVersion, audioCancelAfter)
 					if errAsend != nil {
 						log.Error(fmt.Sprintf("%s - Sending audio segment. SeqID: %d. Err: %v", deliverySessionID, f.Headers.SeqId, errAsend))
 						atomic.AddInt32(&exitFunc, 1) // exit Probably context is gone
@@ -242,7 +274,7 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 			}
 
 			if !somethingSent && atomic.LoadInt32(&inFlightReq) < MAX_INFLIGHT_REQUEST_BEFORE_STOP_VIDEO {
-				videoFileToSend, errGetVideoFile := getSendFile(assetID, "video", rewindMs, memFiles, deliverySession, videoJitterMs, startedAt, endAt)
+				videoFileToSend, errGetVideoFile := getSendFile(sessionType, assetID, "video", rewindMs, memFiles, deliverySession, videoJitterMs, startedAt, endAt)
 				if errGetVideoFile != nil {
 					if errGetVideoFile.Error() == "EOS" {
 						log.Info(fmt.Sprintf("%s - Video, detected end of stream", deliverySessionID))
@@ -255,7 +287,7 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 				}
 				if videoFileToSend != nil {
 					go func(f *memfile.MemFile) {
-						errVsend := sendFile(session, deliverySessionID, &inFlightReq, f, packagerVersion)
+						errVsend := sendFile(session, deliverySessionID, &inFlightReq, f, packagerVersion, videoCancelAfter)
 						if errVsend != nil {
 							log.Error(fmt.Sprintf("%s - Sending video segment. SeqID: %d. Err: %v", deliverySessionID, f.Headers.SeqId, errVsend))
 							atomic.AddInt32(&exitFunc, 1) // exit Probably context is gone
@@ -284,10 +316,14 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 
 // Helpers
 
-func sendFile(session *webtransport.Session, deliverySessionID string, inFlightReq *int32, f *memfile.MemFile, packagerVersion mediapackager.PackagerVersion) error {
+func sendFile(session *webtransport.Session, deliverySessionID string, inFlightReq *int32, f *memfile.MemFile, packagerVersion mediapackager.PackagerVersion, cancelAfter time.Duration) error {
 	sUni, errOpenStream := session.OpenUniStreamSync(session.Context())
 	if errOpenStream != nil {
 		return errOpenStream
+	}
+
+	if cancelAfter > 0 {
+		sUni.SetWriteDeadline(time.Now().Add(cancelAfter))
 	}
 
 	atomic.AddInt32(inFlightReq, 1)
@@ -334,18 +370,16 @@ func sendFile(session *webtransport.Session, deliverySessionID string, inFlightR
 	return errSend
 }
 
-func getSendFile(assetID string, mediaType string, rewindMs uint, memFiles *memfiles.MemFiles, deliverySession *deliverysession.DeliverySession, playerJitterBufferMs uint, startedAt time.Time, endAt time.Time) (f *memfile.MemFile, err error) {
-	if !startedAt.IsZero() && !endAt.IsZero() {
-		// Vod / highlight
+func getSendFile(sessionType string, assetID string, mediaType string, rewindMs uint, memFiles *memfiles.MemFiles, deliverySession *deliverysession.DeliverySession, playerJitterBufferMs uint, startedAt time.Time, endAt time.Time) (f *memfile.MemFile, err error) {
+	switch sessionType {
+	case DeliverySessionLiveEdge:
+		f = memFiles.GetFileForAssetNewestSeqId(assetID, mediaType, time.Duration(playerJitterBufferMs)*time.Millisecond, deliverySession)
+	case DeliverySessionLiveRewind:
+		f = memFiles.GetNextByTimeSeqId(assetID, mediaType, time.Duration(playerJitterBufferMs)*time.Millisecond, time.Duration(rewindMs)*time.Millisecond, deliverySession)
+	case DeliverySessionVOD:
 		f, err = memFiles.GetNextByStartEnd(assetID, mediaType, time.Duration(playerJitterBufferMs)*time.Millisecond, startedAt, endAt, deliverySession)
-	} else {
-		if rewindMs == 0 {
-			// Edge
-			f = memFiles.GetFileForAssetNewestSeqId(assetID, mediaType, time.Duration(playerJitterBufferMs)*time.Millisecond, deliverySession)
-		} else {
-			// Rewind
-			f = memFiles.GetNextByTimeSeqId(assetID, mediaType, time.Duration(playerJitterBufferMs)*time.Millisecond, time.Duration(rewindMs)*time.Millisecond, deliverySession)
-		}
+	default:
+		err = errors.New(fmt.Sprintf("Unknown session type: %s", sessionType))
 	}
 	return
 }

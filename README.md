@@ -236,7 +236,10 @@ cd src
 Note: To test the code in your computer and Chrome you can use the script `scripts/start-chrome.sh` that allows you to use WebTransport in your localhost (not safe environment)
 
 # TODO
+- Cancel QUIC stream after some reasonable time (?) in mode live
 - Start at IDR, now player discards before IDR
+- Implement priorities (sendOrder). Audio bigger priori than video
+- Stop sending video if the inflight request (in time) > jitter buffer
 - Do not wait for 5ms, wake up when it is time to send next
 - Drop all the video frames until next IDR if we detect a P missing
 - Characterize protocol behavior in front of network defects
