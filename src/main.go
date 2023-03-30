@@ -56,7 +56,7 @@ const MAX_INFLIGHT_REQUEST_BEFORE_STOP_VIDEO = 10
 const AUDIO_OFFSET_SEND_PRIORITY = math.MaxInt / 2
 
 // Delivery: Cancel request after (0 means NO cancel)
-const LIVE_CANCEL_AFTER_TIMES_JITTER = 10
+const LIVE_CANCEL_AFTER_TIMES_JITTER = 0
 
 // Delivery: ONLY DEBUG (limit connection bitrate), 0 means NO throttled
 const MAX_DELIVERY_BPS = 0
@@ -521,11 +521,13 @@ func main() {
 		}
 		log.Info(fmt.Sprintf("%s - Accepted incoming WebTransport session. rawQuery: %s", deliverySessionID, r.URL.RawQuery))
 
-		hijacker, okHijack := rw.(http3.Hijacker)
-		if !okHijack {
-			log.Warn("Unable to hijack the connection")
-		} else {
-			hijacker.Connection().SetMaxBandwidth(MAX_DELIVERY_BPS)
+		if MAX_DELIVERY_BPS > 0 {
+			hijacker, okHijack := rw.(http3.Hijacker)
+			if !okHijack {
+				log.Warn("Unable to hijack the connection")
+			} else {
+				hijacker.Connection().SetMaxBandwidth(MAX_DELIVERY_BPS)
+			}
 		}
 
 		handleWebTransportDeliveryStreams(conn, deliverySessionID, r.URL.Path, r.URL.Query(), memFiles)
