@@ -322,9 +322,7 @@ func sendFile(session *webtransport.Session, deliverySessionID string, inFlightR
 		return errOpenStream
 	}
 
-	if cancelAfter > 0 {
-		sUni.SetWriteDeadline(time.Now().Add(cancelAfter))
-	}
+	startReqTime := time.Now()
 
 	atomic.AddInt32(inFlightReq, 1)
 
@@ -350,6 +348,13 @@ func sendFile(session *webtransport.Session, deliverySessionID string, inFlightR
 	var errRead error = nil
 	for errRead == nil {
 		readBytes, errRead = srcReader.Read(dataBlock)
+		if cancelAfter > 0 {
+			if startReqTime.Add(cancelAfter).Before(time.Now()) {
+				sUni.CancelWrite(1000) //TODO: What code
+				log.Warn(fmt.Sprintf("%s(%v) - Cancelled request due to timeout. MediaType: %s, SeqID: %d", deliverySessionID, sUni.StreamID(), f.Headers.MediaType, f.Headers.SeqId))
+				break
+			}
+		}
 		if readBytes > 0 {
 			sUni.Write(dataBlock[:readBytes])
 			totalSent += readBytes
