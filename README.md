@@ -237,6 +237,7 @@ Note: To test the code in your computer and Chrome you can use the script `scrip
 
 # TODO
 - Start at IDR, now player discards before IDR
+- Cancel the request after is no longer usable
 - Do not wait for 5ms, wake up when it is time to send next
 - Drop all the video frames until next IDR if we detect a P missing
 - Characterize protocol behavior in front of network defects
