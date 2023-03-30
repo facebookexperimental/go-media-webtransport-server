@@ -50,13 +50,16 @@ const DELIVERY_SESSION_WINDOW_DEFAULT_MS = 300
 const MAX_INFLIGHT_REQUEST = 300
 
 // Delivery: Max inflight request before stop sending video
-const MAX_INFLIGHT_REQUEST_BEFORE_STOP_VIDEO = 30
+const MAX_INFLIGHT_REQUEST_BEFORE_STOP_VIDEO = 10
 
 // Delivery: Audio will have this priority over video
 const AUDIO_OFFSET_SEND_PRIORITY = math.MaxInt / 2
 
 // Delivery: Cancel request after (0 means NO cancel)
-const LIVE_CANCEL_AFTER_TIMES_JITTER = 0
+const LIVE_CANCEL_AFTER_TIMES_JITTER = 10
+
+// Delivery: ONLY DEBUG (limit connection bitrate), 0 means NO throttled
+const MAX_DELIVERY_BPS = 0
 
 func readBytes(s *webtransport.ReceiveStream, buffer []byte) error {
 	readSize := 0
@@ -260,7 +263,7 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 				somethingSent = true
 			}
 
-			if !somethingSent && atomic.LoadInt32(&inFlightReq) < MAX_INFLIGHT_REQUEST_BEFORE_STOP_VIDEO {
+			if !somethingSent && (atomic.LoadInt32(&inFlightReq) < MAX_INFLIGHT_REQUEST_BEFORE_STOP_VIDEO) {
 				videoFileToSend, errGetVideoFile := getSendFile(sessionType, assetID, "video", rewindMs, memFiles, deliverySession, videoJitterMs, startedAt, endAt)
 				if errGetVideoFile != nil {
 					if errGetVideoFile.Error() == "EOS" {
@@ -296,6 +299,9 @@ func handleWebTransportDeliveryStreams(session *webtransport.Session, deliverySe
 					atomic.AddInt32(&exitFunc, 1)
 					log.Error(fmt.Sprintf("%s - killing session because too many inflight requests", deliverySessionID))
 				}
+
+				// Allow scheduler to run
+				time.Sleep(time.Duration(1) * time.Millisecond)
 			}
 		}
 	}()
@@ -349,22 +355,19 @@ func getDeliverySessionType(rewindMs uint, startedAt time.Time, endAt time.Time)
 }
 
 func sendFile(session *webtransport.Session, deliverySessionID string, inFlightReq *int32, f *memfile.MemFile, packagerVersion mediapackager.PackagerVersion, sendPriority int, expiration time.Duration) error {
+	startAt := time.Now()
+
 	sUni, errOpenStream := session.OpenUniStreamSync(session.Context())
 	if errOpenStream != nil {
 		return errOpenStream
 	}
 	sUni.SetPriority(sendPriority)
 
-	if expiration > 0 {
-		// This closes gracefully the stream, so the received does NOT know it is uncomplete
-		sUni.SetWriteDeadline(time.Now().Add(expiration))
-	}
-
 	atomic.AddInt32(inFlightReq, 1)
 
 	atomic.LoadInt32(inFlightReq)
 
-	log.Info(fmt.Sprintf("%s(%v) - Start sending frame. MediaType: %s, SeqID: %d (current inflight: %d)", deliverySessionID, sUni.StreamID(), f.Headers.MediaType, f.Headers.SeqId, atomic.LoadInt32(inFlightReq)))
+	log.Info(fmt.Sprintf("%s(%v) - Start sending frame. MediaType: %s, SeqID: %d (current inflight: %d), priority: %d, expiration: %s", deliverySessionID, sUni.StreamID(), f.Headers.MediaType, f.Headers.SeqId, atomic.LoadInt32(inFlightReq), sendPriority, expiration))
 
 	dataHeaderBytes, errDataHeaderEncode := mediapackager.Encode(f.Headers, packagerVersion)
 	if errDataHeaderEncode != nil {
@@ -377,16 +380,28 @@ func sendFile(session *webtransport.Session, deliverySessionID string, inFlightR
 	sUni.Write(dataHeaderLengthBytes)
 	sUni.Write(dataHeaderBytes)
 
+	isCancel := false
 	dataBlock := make([]byte, COPY_BLOCK_BYTES)
 	srcReader := f.NewReadCloser()
 	readBytes := 0
 	totalSent := 0
 	var errRead error = nil
 	for errRead == nil {
+		if expiration > 0 && time.Since(startAt) > expiration {
+			sUni.CancelWrite(1)
+			isCancel = true
+			log.Warn(fmt.Sprintf("%s(%v) - Cancelled request because expiration. MediaType: %s, SeqID: %d. Expiration (ms): %d", deliverySessionID, sUni.StreamID(), f.Headers.MediaType, f.Headers.SeqId, expiration.Milliseconds()))
+			break
+		}
 		readBytes, errRead = srcReader.Read(dataBlock)
 		if readBytes > 0 {
 			sUni.Write(dataBlock[:readBytes])
 			totalSent += readBytes
+		} else {
+			if errRead == nil {
+				// Wait to get more bytes from source if returns 0 bytes
+				time.Sleep(time.Duration(5) * time.Millisecond)
+			}
 		}
 	}
 	errReaderClose := srcReader.Close()
@@ -394,11 +409,13 @@ func sendFile(session *webtransport.Session, deliverySessionID string, inFlightR
 		atomic.AddInt32(inFlightReq, -1)
 		return errReaderClose
 	}
-	errSend := sUni.Close()
-	if errSend == nil {
-		log.Info(fmt.Sprintf("%s(%v) - Sent frame. MediaType: %s, SeqID: %d", deliverySessionID, sUni.StreamID(), f.Headers.MediaType, f.Headers.SeqId))
+	var errSend error = nil
+	if !isCancel {
+		errSend = sUni.Close()
+		if errSend == nil {
+			log.Info(fmt.Sprintf("%s(%v) - Sent frame. MediaType: %s, SeqID: %d. Sent time (ms): %d", deliverySessionID, sUni.StreamID(), f.Headers.MediaType, f.Headers.SeqId, time.Since(startAt).Milliseconds()))
+		}
 	}
-
 	atomic.AddInt32(inFlightReq, -1)
 
 	return errSend
@@ -503,6 +520,13 @@ func main() {
 			return
 		}
 		log.Info(fmt.Sprintf("%s - Accepted incoming WebTransport session. rawQuery: %s", deliverySessionID, r.URL.RawQuery))
+
+		hijacker, okHijack := rw.(http3.Hijacker)
+		if !okHijack {
+			log.Warn("Unable to hijack the connection")
+		} else {
+			hijacker.Connection().SetMaxBandwidth(MAX_DELIVERY_BPS)
+		}
 
 		handleWebTransportDeliveryStreams(conn, deliverySessionID, r.URL.Path, r.URL.Query(), memFiles)
 	})
