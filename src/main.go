@@ -431,8 +431,8 @@ func main() {
 		TLSKey:         webtransport.CertFile{Path: "../certs/certificate.key"},
 		AllowedOrigins: []string{"moq-test.jordicenzano.dev", "googlechrome.github.io", "127.0.0.1:8080", "localhost:8080", "new-tab-page", ""},
 		QuicConfig: &webtransport.QuicConfig{
-			KeepAlive:      true,
-			MaxIdleTimeout: 30 * time.Second,
+			KeepAlivePeriod: 10 * time.Second,
+			MaxIdleTimeout:  30 * time.Second,
 		},
 	}
 
